@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>WebXR Video with Depth</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body {
+            margin: 0;
+            background-color: #000;
+            overflow: hidden;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+            color: white;
+            text-shadow: 0 0 5px #000;
+            pointer-events: none;
+        }
+        #webgl-canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+        #video {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        WebXR Video with Depth - Use WebXR device to view
+    </div>
+    <video id="video" loop crossorigin="anonymous" muted playsinline src="beach.mp4"></video>
+    <div id="container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.167.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.167.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { XRButton } from 'three/addons/webxr/XRButton.js';
+
+        let scene, camera, renderer, controls, video, videoTexture, particles, particleMaterial;
+        const GRID_WIDTH = 512;
+        const GRID_HEIGHT = 256;
+        const VISUAL_RESOLUTION_X = 1024;
+        const VISUAL_RESOLUTION_Y = 512;
+
+        function init() {
+            const container = document.getElementById('container');
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 10000);
+            camera.position.z = 210;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setClearColor(0x000000, 1);
+            renderer.xr.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            document.body.appendChild(XRButton.createButton(renderer, { requiredFeatures: ['hand-tracking'] }));
+
+            // Video setup
+            video = document.getElementById('video');
+            video.play().catch(e => console.error('Video auto-play failed:', e));
+            videoTexture = new THREE.VideoTexture(video);
+            videoTexture.minFilter = THREE.NearestFilter;
+            videoTexture.magFilter = THREE.NearestFilter;
+            videoTexture.format = THREE.RGBAFormat;
+
+            // Particle geometry
+            const geometry = createParticleGeometry(GRID_WIDTH, GRID_HEIGHT);
+
+            // Particle material
+            particleMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    u_videoTexture: { value: videoTexture },
+                    u_size: { value: 2000.0 },
+                    u_focalLengthX: { value: 1100.0 },
+                    u_focalLengthY: { value: 1100.0 },
+                    u_minZ: { value: -1000.0 },
+                    u_maxZ: { value: -120.0 },
+                    u_resolution: { value: new THREE.Vector2(VISUAL_RESOLUTION_X, VISUAL_RESOLUTION_Y) },
+                    u_depthMapResolution: { value: new THREE.Vector2(VISUAL_RESOLUTION_X, VISUAL_RESOLUTION_Y / 2) },
+                    u_reverseDepth: { value: 0.0 },
+                    u_farOffAmount: { value: 0.0 }
+                },
+                vertexShader: `
+                    uniform sampler2D u_videoTexture;
+                    uniform float u_size;
+                    uniform float u_focalLengthX;
+                    uniform float u_focalLengthY;
+                    uniform float u_minZ;
+                    uniform float u_maxZ;
+                    uniform vec2 u_resolution;
+                    uniform vec2 u_depthMapResolution;
+                    uniform float u_reverseDepth;
+
+                    varying vec2 vOriginalUv;
+                    varying float vDepth;
+
+                    void main() {
+                        vec2 gridUv = position.xy;
+                        vOriginalUv = gridUv;
+                        vec2 depthTextureUv = vec2(gridUv.x, gridUv.y * 0.5);
+                        vec2 depthTexelSize = 1. / u_depthMapResolution;
+                        vec2 pixelCoord = depthTextureUv * u_depthMapResolution;
+                        vec2 fractCoord = fract(pixelCoord);
+                        vec2 basePixel = floor(pixelCoord);
+                        vec2 uv00 = (basePixel + vec2(0.5, 0.5)) * depthTexelSize;
+                        vec2 uv10 = (basePixel + vec2(1.5, 0.5)) * depthTexelSize;
+                        vec2 uv01 = (basePixel + vec2(0.5, 1.5)) * depthTexelSize;
+                        vec2 uv11 = (basePixel + vec2(1.5, 1.5)) * depthTexelSize;
+                        float d00 = texture2D(u_videoTexture, uv00).r;
+                        float d10 = texture2D(u_videoTexture, uv10).r;
+                        float d01 = texture2D(u_videoTexture, uv01).r;
+                        float d11 = texture2D(u_videoTexture, uv11).r;
+                        float interp0 = mix(d00, d10, fractCoord.x);
+                        float interp1 = mix(d01, d11, fractCoord.y);
+                        float depth = mix(interp0, interp1, fractCoord.y);
+                        depth = clamp(depth, 0.0, 1.0);
+                        vDepth = depth;
+                        if (u_reverseDepth > 0.5) {
+                            depth = 1.0 - depth;
+                        }
+                        float x_pixel = (1.0 - gridUv.x) * u_resolution.x - u_resolution.x / 2.0;
+                        float y_pixel = (1.0 - gridUv.y) * u_resolution.y - u_resolution.y / 2.0;
+                        float z_world = mix(u_minZ, u_maxZ, depth);
+                        vec3 particlePosition;
+                        particlePosition.x = (x_pixel * z_world) / u_focalLengthX;
+                        particlePosition.y = (y_pixel * z_world) / u_focalLengthY;
+                        particlePosition.z = z_world;
+                        vec4 modelViewPosition = modelViewMatrix * vec4(particlePosition, 1.0);
+                        gl_Position = projectionMatrix * modelViewPosition;
+                        float objectScale = length(vec3(modelViewMatrix[0]));
+                        gl_PointSize = u_size * objectScale * (1.0 / -modelViewPosition.z);
+                    }
+                `,
+                fragmentShader: `
+                    uniform sampler2D u_videoTexture;
+                    varying vec2 vOriginalUv;
+                    varying float vDepth;
+                    uniform float u_farOffAmount;
+
+                    void main() {
+                        if (vOriginalUv.y > 0.994) discard;
+                        if (length(gl_PointCoord - vec2(0.5, 0.5)) > 0.5) {
+                            discard;
+                        }
+                        vec2 colorUv = vec2(vOriginalUv.x, vOriginalUv.y * 0.5 + 0.5);
+                        vec4 color = texture2D(u_videoTexture, colorUv);
+                        if (color.a < 0.1) discard;
+                        float farFadeOpacity = u_farOffAmount > 0.001 ? smoothstep(0.0, u_farOffAmount, vDepth) : 1.0;
+                        color.a *= farFadeOpacity * 0.65;
+                        if (color.a < 0.1) discard;
+                        gl_FragColor = color;
+                    }
+                `,
+                transparent: true
+            });
+
+            particles = new THREE.Points(geometry, particleMaterial);
+            particles.frustumCulled = false;
+            scene.add(particles);
+
+            // Adjust for WebXR
+            renderer.xr.addEventListener('sessionstart', () => {
+                particleMaterial.uniforms.u_size.value = 2400.0;
+                particles.scale.set(0.009, 0.009, 0.009);
+                particles.position.set(0, 1.4, 0.5);
+            });
+            renderer.xr.addEventListener('sessionend', () => {
+                particleMaterial.uniforms.u_size.value = 2000.0;
+                particles.scale.set(1, 1, 1);
+                particles.position.set(0, 0, 0);
+            });
+
+            // Orbit controls for desktop
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            window.addEventListener('resize', onWindowResize);
+            renderer.setAnimationLoop(animate);
+        }
+
+        function createParticleGeometry(width, height) {
+            const NUM_PARTICLES = width * height;
+            const geometry = new THREE.BufferGeometry();
+            const gridUvs = new Float32Array(NUM_PARTICLES * 3);
+            let pIdx = 0;
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    gridUvs[pIdx * 3 + 0] = x / (width - 1);
+                    gridUvs[pIdx * 3 + 1] = y / (height - 1);
+                    gridUvs[pIdx * 3 + 2] = 0;
+                    pIdx++;
+                }
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(gridUvs, 3));
+            return geometry;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
